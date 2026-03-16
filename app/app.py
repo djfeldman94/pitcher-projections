@@ -38,7 +38,6 @@ def categorize_columns(columns: list[str]) -> dict[str, list[str]]:
     cats = {name: [] for name in FEATURE_CATEGORIES}
     for col in columns:
         placed = False
-        # Check specific categories first (order matters — most specific first)
         for cat_name in ["Statcast Pitch Data", "PitchInfo Pitch Data",
                          "Stuff+ / Location+ / Pitching+", "Botball Models",
                          "Plus Stats (park-adjusted)"]:
@@ -48,7 +47,6 @@ def categorize_columns(columns: list[str]) -> dict[str, list[str]]:
                 break
         if not placed:
             cats["Traditional / General"].append(col)
-    # Sort within each category and drop empties
     return {k: sorted(v) for k, v in cats.items() if v}
 
 
@@ -78,30 +76,17 @@ def delete_config(name: str):
 
 @st.cache_data
 def load_base_data():
-    """Load the raw pitching stats (before feature engineering)."""
     return pd.read_parquet(DATA_DIR / "pitching_stats.parquet")
 
 
 @st.cache_data
 def get_available_features(df_columns: tuple) -> list[str]:
-    """Get all numeric columns usable as features."""
     df = load_base_data()
     numeric = df.select_dtypes(include="number").columns.tolist()
     return sorted(c for c in numeric if c not in EXCLUDE_COLS)
 
 
-def engineer_features(df: pd.DataFrame, base_features: list[str], engineering: dict[str, list[str]]) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Apply time-series feature engineering.
-
-    Args:
-        df: Base dataframe sorted by player/season
-        base_features: Selected raw features
-        engineering: Maps suffix -> list of columns to engineer
-
-    Returns:
-        (dataframe with new columns, list of all feature column names)
-    """
+def engineer_features(df, base_features, engineering):
     ps = df.copy().sort_values(["IDfg", "Season"])
     all_feature_cols = list(base_features)
 
@@ -122,9 +107,7 @@ def engineer_features(df: pd.DataFrame, base_features: list[str], engineering: d
                 ps[f"{col}{suffix}"] = (ps[col] + t1 + t2) / 3
             all_feature_cols.append(f"{col}{suffix}")
 
-    # Add the target column
     ps["ERA_next"] = ps.groupby("IDfg")["ERA"].shift(-1)
-
     return ps, all_feature_cols
 
 
@@ -153,6 +136,55 @@ def train_and_predict(ps, feature_cols, season_to_predict, n_estimators, max_dep
     return model, target, valid_features
 
 
+# ── Helpers: collect current widget state into a config dict ──
+
+def _gather_current_selections():
+    """Read all widget values and return the full pending config."""
+    base_feats = []
+    for cat_cols in categorized.values():
+        for feat in cat_cols:
+            if st.session_state.get(f"base_{feat}", False):
+                base_feats.append(feat)
+
+    eng = {}
+    for suffix in ENGINEERING_OPTIONS.values():
+        chosen = []
+        for feat in sorted(base_feats):
+            if st.session_state.get(f"eng_{suffix}_{feat}", False):
+                chosen.append(feat)
+        if chosen:
+            eng[suffix] = chosen
+
+    return {
+        "base_features": base_feats,
+        "engineering": eng,
+        "n_estimators": st.session_state.get("w_n_estimators", 500),
+        "max_depth": st.session_state.get("w_max_depth", 6),
+        "learning_rate": st.session_state.get("w_learning_rate", 0.07),
+        "min_ip": st.session_state.get("w_min_ip", 15),
+        "season_to_predict": st.session_state.get("w_season", 2025),
+    }
+
+
+def _configs_differ(a: dict, b: dict) -> bool:
+    """Check if two configs differ in any meaningful way."""
+    for key in ["n_estimators", "max_depth", "min_ip", "season_to_predict"]:
+        if a.get(key) != b.get(key):
+            return True
+    if abs(a.get("learning_rate", 0) - b.get("learning_rate", 0)) > 1e-6:
+        return True
+    if sorted(a.get("base_features", [])) != sorted(b.get("base_features", [])):
+        return True
+    a_eng = a.get("engineering", {})
+    b_eng = b.get("engineering", {})
+    if set(a_eng.keys()) != set(b_eng.keys()):
+        return True
+    for k in a_eng:
+        if sorted(a_eng[k]) != sorted(b_eng.get(k, [])):
+            return True
+    return False
+
+
 # ─── Page config ───────────────────────────────────────────────
 st.set_page_config(page_title="Pitcher Projections", layout="wide")
 st.title("MLB Pitcher ERA Projections")
@@ -168,13 +200,12 @@ categorized = categorize_columns(available_features)
 if not (CONFIGS_DIR / "dylan-config.json").exists():
     with open(DATA_DIR / "feature_columns.json") as f:
         dylan_features = json.load(f)
-    # Split into base features and engineered
     dylan_base = [f for f in dylan_features if not any(f.endswith(s) for s in ["_t1", "_t2", "_delta_1yr", "_avg_3yr"])]
     dylan_eng = {}
-    for f in dylan_features:
+    for feat in dylan_features:
         for suffix in ["_delta_1yr", "_t1", "_t2"]:
-            if f.endswith(suffix):
-                base = f[: -len(suffix)]
+            if feat.endswith(suffix):
+                base = feat[: -len(suffix)]
                 dylan_eng.setdefault(suffix, [])
                 if base not in dylan_eng[suffix]:
                     dylan_eng[suffix].append(base)
@@ -203,40 +234,85 @@ default_lr = 0.07
 default_min_ip = 15
 default_season = predict_seasons[-1]
 
-if selected_config != "(none)":
-    cfg = load_config(selected_config)
-    # Support both old format (flat "features") and new format ("base_features" + "engineering")
+
+def _parse_config(cfg: dict) -> tuple[list[str], dict[str, list[str]]]:
+    """Parse a saved config into (base_features, engineering) regardless of format."""
     if "base_features" in cfg:
-        default_base_features = [f for f in cfg["base_features"] if f in available_features]
-        default_engineering = cfg.get("engineering", {})
+        base = [f for f in cfg["base_features"] if f in available_features]
+        eng = cfg.get("engineering", {})
     elif "features" in cfg:
-        # Old format: split into base vs engineered
-        default_base_features = [f for f in cfg["features"] if f in available_features and not any(f.endswith(s) for s in ["_t1", "_t2", "_delta_1yr", "_avg_3yr"])]
-        default_engineering = {}
-        for f in cfg["features"]:
+        base = [f for f in cfg["features"] if f in available_features and not any(f.endswith(s) for s in ["_t1", "_t2", "_delta_1yr", "_avg_3yr"])]
+        eng = {}
+        for feat in cfg["features"]:
             for suffix in ["_delta_1yr", "_t1", "_t2", "_avg_3yr"]:
-                if f.endswith(suffix):
-                    base = f[: -len(suffix)]
-                    if base in available_features:
-                        default_engineering.setdefault(suffix, [])
-                        if base not in default_engineering[suffix]:
-                            default_engineering[suffix].append(base)
+                if feat.endswith(suffix):
+                    b = feat[: -len(suffix)]
+                    if b in available_features:
+                        eng.setdefault(suffix, [])
+                        if b not in eng[suffix]:
+                            eng[suffix].append(b)
+    else:
+        base, eng = [], {}
+    return base, eng
+
+
+def _push_config_to_widgets(cfg: dict):
+    """Write a saved config into all widget session state keys."""
+    base_feats, engineering = _parse_config(cfg)
+    base_set = set(base_feats)
+
+    # Set all base feature checkboxes
+    for cat_cols in categorized.values():
+        for feat in cat_cols:
+            st.session_state[f"base_{feat}"] = feat in base_set
+
+    # Set all engineering checkboxes
+    for suffix in ENGINEERING_OPTIONS.values():
+        eng_set = set(engineering.get(suffix, []))
+        for feat in available_features:
+            sk = f"eng_{suffix}_{feat}"
+            if sk in st.session_state:
+                st.session_state[sk] = feat in eng_set
+
+    # Set model parameter widgets
+    st.session_state["w_n_estimators"] = cfg.get("n_estimators", 500)
+    st.session_state["w_max_depth"] = cfg.get("max_depth", 6)
+    st.session_state["w_learning_rate"] = cfg.get("learning_rate", 0.07)
+    st.session_state["w_min_ip"] = cfg.get("min_ip", 15)
+    season = cfg.get("season_to_predict", predict_seasons[-1])
+    if season in predict_seasons:
+        st.session_state["w_season"] = season
+
+
+# Detect config dropdown change and push values into widget state
+if selected_config != "(none)":
+    if st.session_state.get("_loaded_config_name") != selected_config:
+        cfg = load_config(selected_config)
+        _push_config_to_widgets(cfg)
+        st.session_state["_loaded_config_name"] = selected_config
+        st.rerun()
+
+    cfg = load_config(selected_config)
+    default_base_features, default_engineering = _parse_config(cfg)
     default_n_est = cfg.get("n_estimators", 500)
     default_depth = cfg.get("max_depth", 6)
     default_lr = cfg.get("learning_rate", 0.07)
     default_min_ip = cfg.get("min_ip", 15)
     default_season = cfg.get("season_to_predict", predict_seasons[-1])
+else:
+    if st.session_state.get("_loaded_config_name") is not None:
+        st.session_state["_loaded_config_name"] = None
 
 # ─── Sidebar: model parameters ────────────────────────────────
 st.sidebar.header("Model Parameters")
-n_estimators = st.sidebar.slider("n_estimators", 50, 1500, default_n_est, step=50)
-max_depth = st.sidebar.slider("max_depth", 2, 12, default_depth)
-learning_rate = st.sidebar.slider("learning_rate", 0.01, 0.30, default_lr, step=0.01)
+n_estimators = st.sidebar.slider("n_estimators", 50, 1500, default_n_est, step=50, key="w_n_estimators")
+max_depth = st.sidebar.slider("max_depth", 2, 12, default_depth, key="w_max_depth")
+learning_rate = st.sidebar.slider("learning_rate", 0.01, 0.30, default_lr, step=0.01, key="w_learning_rate")
 
 st.sidebar.header("Data Filters")
-min_ip = st.sidebar.number_input("Minimum IP", min_value=1, max_value=100, value=default_min_ip)
+min_ip = st.sidebar.number_input("Minimum IP", min_value=1, max_value=100, value=default_min_ip, key="w_min_ip")
 season_idx = predict_seasons.index(default_season) if default_season in predict_seasons else len(predict_seasons) - 1
-season_to_predict = st.sidebar.selectbox("Season to predict", options=predict_seasons, index=season_idx)
+season_to_predict = st.sidebar.selectbox("Season to predict", options=predict_seasons, index=season_idx, key="w_season")
 
 # ─── Sidebar: save / delete config ────────────────────────────
 st.sidebar.header("Save Config")
@@ -247,27 +323,32 @@ st.header("Feature Selection")
 
 tab_base, tab_eng = st.tabs(["Base Features", "Engineered Features (time-series)"])
 
-# Number of columns for checkbox grids
 N_COLS = 4
 
 
 def _toggle_all(keys: list[str], select_all_key: str):
-    """Callback: sync individual checkboxes to the select-all state."""
     val = st.session_state[select_all_key]
     for k in keys:
         st.session_state[k] = val
+
+
+def _clear_keys(keys: list[str]):
+    for k in keys:
+        st.session_state[k] = False
 
 
 # ── Tab 1: Base feature selection by category ─────────────────
 with tab_base:
     st.caption("Select the raw stats to include as model inputs. Organized by category — expand each to pick individual features.")
 
-    # Initialize session state defaults for all base feature checkboxes (first run only)
     for cat_cols in categorized.values():
         for feat in cat_cols:
             sk = f"base_{feat}"
             if sk not in st.session_state:
                 st.session_state[sk] = feat in default_base_features
+
+    all_base_keys = [f"base_{feat}" for cat_cols in categorized.values() for feat in cat_cols]
+    st.button("Clear all base features", on_click=_clear_keys, args=(all_base_keys,), key="reset_base")
 
     selected_base_features: list[str] = []
 
@@ -307,13 +388,15 @@ with tab_eng:
     if not eligible_for_engineering:
         st.warning("Select some base features first.")
     else:
-        # Initialize session state defaults for engineering checkboxes (first run only)
         for suffix in ENGINEERING_OPTIONS.values():
             eng_defaults_for_suffix = set(default_engineering.get(suffix, []))
             for feat in eligible_for_engineering:
                 sk = f"eng_{suffix}_{feat}"
                 if sk not in st.session_state:
                     st.session_state[sk] = feat in eng_defaults_for_suffix
+
+        all_eng_keys = [f"eng_{suffix}_{feat}" for suffix in ENGINEERING_OPTIONS.values() for feat in eligible_for_engineering]
+        st.button("Clear all engineered features", on_click=_clear_keys, args=(all_eng_keys,), key="reset_eng")
 
         for label, suffix in ENGINEERING_OPTIONS.items():
             child_keys = [f"eng_{suffix}_{feat}" for feat in eligible_for_engineering]
@@ -346,28 +429,53 @@ if not selected_base_features:
     st.error("Select at least one base feature.")
     st.stop()
 
-# ─── Build features and train ─────────────────────────────────
-with st.spinner("Engineering features & training model..."):
-    processed_df, all_feature_cols = engineer_features(base_df, selected_base_features, engineering_selections)
-    model, predictions, valid_features = train_and_predict(
-        processed_df, all_feature_cols, season_to_predict, n_estimators, max_depth, learning_rate, min_ip,
-    )
+# ─── Apply button / change detection ─────────────────────────
+pending_config = _gather_current_selections()
 
-# ─── Save config button (after features are resolved) ─────────
-def _build_current_config():
-    return {
-        "base_features": selected_base_features,
-        "engineering": engineering_selections,
-        "n_estimators": n_estimators,
-        "max_depth": max_depth,
-        "learning_rate": learning_rate,
-        "min_ip": min_ip,
-        "season_to_predict": season_to_predict,
-    }
+# On first run, auto-apply so there's something to show
+if "applied_config" not in st.session_state:
+    st.session_state["applied_config"] = pending_config
 
+has_changes = _configs_differ(pending_config, st.session_state["applied_config"])
+
+if has_changes:
+    st.markdown("---")
+    col_apply, col_msg = st.columns([1, 3])
+    with col_apply:
+        if st.button("Apply Changes", type="primary", use_container_width=True):
+            st.session_state["applied_config"] = pending_config
+            st.rerun()
+    with col_msg:
+        st.warning("You have unapplied changes. Click **Apply Changes** to retrain the model.", icon="\u26a0\ufe0f")
+    st.markdown("---")
+
+# ─── Train using the APPLIED config (cached in session state) ─
+applied = st.session_state["applied_config"]
+
+# Only retrain when the applied config actually changes
+applied_key = json.dumps(applied, sort_keys=True, default=str)
+if st.session_state.get("_trained_key") != applied_key:
+    with st.spinner("Engineering features & training model..."):
+        processed_df, all_feature_cols = engineer_features(
+            base_df, applied["base_features"], applied["engineering"],
+        )
+        model, predictions, valid_features = train_and_predict(
+            processed_df, all_feature_cols,
+            applied["season_to_predict"],
+            applied["n_estimators"],
+            applied["max_depth"],
+            applied["learning_rate"],
+            applied["min_ip"],
+        )
+        st.session_state["_trained_key"] = applied_key
+        st.session_state["_trained_results"] = (model, predictions, valid_features, processed_df)
+else:
+    model, predictions, valid_features, processed_df = st.session_state["_trained_results"]
+
+# ─── Save config button (uses pending so you save what you see) ─
 if st.sidebar.button("Save"):
     if save_name.strip():
-        save_config(save_name.strip(), _build_current_config())
+        save_config(save_name.strip(), pending_config)
         st.sidebar.success(f"Saved '{save_name.strip()}'")
         st.rerun()
 
@@ -377,7 +485,7 @@ if selected_config != "(none)":
         st.rerun()
 
 # ─── Predictions table ────────────────────────────────────────
-st.header(f"{season_to_predict} ERA Predictions")
+st.header(f"{applied['season_to_predict']} ERA Predictions")
 
 display_cols = ["Name", "Team", "Age", "IP", "ERA", "ERA_predicted"]
 available_display = [c for c in display_cols if c in predictions.columns]
@@ -388,7 +496,7 @@ st.dataframe(
 )
 
 # ─── Evaluation vs actuals (if available) ─────────────────────
-actual = processed_df[processed_df["Season"] == season_to_predict]
+actual = processed_df[processed_df["Season"] == applied["season_to_predict"]]
 if not actual.empty:
     merged = predictions.merge(actual[["IDfg", "ERA"]], on="IDfg", suffixes=("_prev", "_actual"))
 
@@ -420,9 +528,8 @@ if not actual.empty:
             ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01, f"{v:.3f}", ha="center")
         st.pyplot(fig)
 
-    # Compare with Steamer/ZiPS if CSVs exist
-    steamer_path = DATA_DIR / f"steamer-{season_to_predict}.csv"
-    zips_path = DATA_DIR / f"zips-{season_to_predict}.csv"
+    steamer_path = DATA_DIR / f"steamer-{applied['season_to_predict']}.csv"
+    zips_path = DATA_DIR / f"zips-{applied['season_to_predict']}.csv"
 
     if steamer_path.exists() and zips_path.exists():
         steamer = pd.read_csv(steamer_path).dropna(subset=["PlayerId", "ERA"])
@@ -451,7 +558,7 @@ if not actual.empty:
             colors = ["steelblue", "coral", "forestgreen", "gray"]
             bars = ax.bar(labels, vals, color=colors)
             ax.set_ylabel("Mean Absolute Error")
-            ax.set_title(f"{season_to_predict} ERA — MAE Comparison")
+            ax.set_title(f"{applied['season_to_predict']} ERA — MAE Comparison")
             for bar, v in zip(bars, vals):
                 ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01, f"{v:.3f}", ha="center")
             st.pyplot(fig)
