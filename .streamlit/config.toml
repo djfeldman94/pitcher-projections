@@ -5,3 +5,53 @@ address = "0.0.0.0"
 
 [browser]
 gatherUsageStats = false
+
+# ── Typography ────────────────────────────────────────────────
+# DM Serif Display for headings (classic, editorial feel)
+# Source Sans 3 for body (clean data readability)
+# JetBrains Mono for code/numbers
+
+[[theme.fontFaces]]
+family = "DM Serif Display"
+url = "https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&display=swap"
+
+[[theme.fontFaces]]
+family = "Source Sans 3"
+url = "https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@300;400;500;600;700&display=swap"
+
+[[theme.fontFaces]]
+family = "JetBrains Mono"
+url = "https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+
+[theme]
+font = "Source Sans 3"
+headingFont = "DM Serif Display"
+codeFont = "JetBrains Mono"
+
+# ── Light Theme ───────────────────────────────────────────────
+[theme.light]
+primaryColor = "#B8432F"
+backgroundColor = "#FAFAF7"
+secondaryBackgroundColor = "#F0EDE6"
+textColor = "#1B2A4A"
+borderColor = "#D4CFC4"
+linkColor = "#B8432F"
+
+[theme.light.sidebar]
+backgroundColor = "#E8E4DB"
+textColor = "#1B2A4A"
+borderColor = "#D4CFC4"
+
+# ── Dark Theme ────────────────────────────────────────────────
+[theme.dark]
+primaryColor = "#D4805A"
+backgroundColor = "#0F1923"
+secondaryBackgroundColor = "#172330"
+textColor = "#E8E2D6"
+borderColor = "#2A3D52"
+linkColor = "#D4805A"
+
+[theme.dark.sidebar]
+backgroundColor = "#0A1118"
+textColor = "#E8E2D6"
+borderColor = "#1B2A3D"

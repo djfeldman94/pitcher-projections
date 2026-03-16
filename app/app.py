@@ -206,9 +206,65 @@ def _configs_differ(a: dict, b: dict) -> bool:
 
 
 # ─── Page config ───────────────────────────────────────────────
-st.set_page_config(page_title="Pitcher Projections", layout="wide")
+st.set_page_config(page_title="Pitcher Projections", layout="wide", page_icon="\u26be")
+
+st.html("""<style>
+    /* Tighten header spacing */
+    h1 { letter-spacing: -0.02em; margin-bottom: 0.1em !important; }
+    h2 { letter-spacing: -0.01em; }
+
+    /* Refine dataframe appearance */
+    .stDataFrame { border-radius: 6px; overflow: hidden; }
+
+    /* Style the Apply button to stand out */
+    button[kind="primary"] {
+        font-weight: 600 !important;
+        letter-spacing: 0.02em;
+    }
+
+    /* Subtle divider styling */
+    hr { opacity: 0.3; }
+
+</style>""")
+
 st.title("MLB Pitcher ERA Projections")
 st.caption("XGBoost model trained on Statcast-era data (2015-2025)")
+
+
+def _get_chart_colors():
+    """Return chart colors that work with the active Streamlit theme."""
+    # Check if dark mode by inspecting the theme config
+    # Streamlit doesn't expose this directly, so we use a sensible default palette
+    # that works well on both light and dark backgrounds
+    return {
+        "scatter": "#5B8DB8",
+        "scatter_edge": "#3A6A94",
+        "bar_model": "#5B8DB8",
+        "bar_steamer": "#D4805A",
+        "bar_zips": "#6BA368",
+        "bar_naive": "#8B8B8B",
+        "line": "#888888",
+        "bg": "none",
+        "text": "#9B9B9B",
+        "title": "#B0B0B0",
+        "grid": "#E0E0E0",
+        "importance": "#5B8DB8",
+    }
+
+
+def _style_ax(ax, fig):
+    """Apply consistent styling to matplotlib axes."""
+    colors = _get_chart_colors()
+    fig.patch.set_facecolor("none")
+    ax.set_facecolor("none")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(colors["grid"])
+    ax.spines["bottom"].set_color(colors["grid"])
+    ax.tick_params(colors=colors["text"], labelsize=10)
+    ax.xaxis.label.set_color(colors["text"])
+    ax.yaxis.label.set_color(colors["text"])
+    ax.title.set_color(colors["title"])
 
 base_df = load_base_data()
 available_features = get_available_features(tuple(base_df.columns))
@@ -532,29 +588,33 @@ if not actual.empty:
 
     col1, col2 = st.columns(2)
 
+    c = _get_chart_colors()
+
     with col1:
         fig, ax = plt.subplots(figsize=(6, 5))
-        ax.scatter(merged["ERA_actual"], merged["ERA_predicted"], alpha=0.6, color="steelblue")
+        _style_ax(ax, fig)
+        ax.scatter(merged["ERA_actual"], merged["ERA_predicted"], alpha=0.7, color=c["scatter"], edgecolors=c["scatter_edge"], linewidth=0.5, s=45)
         lims = [
             max(1.5, merged["ERA_actual"].min() - 0.5),
             min(8, merged["ERA_actual"].max() + 0.5),
         ]
-        ax.plot(lims, lims, "--", color="gray", alpha=0.5)
-        ax.set_xlabel("Actual ERA")
-        ax.set_ylabel("Predicted ERA")
-        ax.set_title("Predicted vs Actual")
-        st.pyplot(fig)
+        ax.plot(lims, lims, "--", color=c["line"], alpha=0.4)
+        ax.set_xlabel("Actual ERA", fontsize=11)
+        ax.set_ylabel("Predicted ERA", fontsize=11)
+        ax.set_title("Predicted vs Actual", fontsize=13, fontweight="bold")
+        st.pyplot(fig, transparent=True)
 
     with col2:
         mae = mean_absolute_error(merged["ERA_actual"], merged["ERA_predicted"])
         naive_mae = mean_absolute_error(merged["ERA_actual"], merged["ERA_prev"])
         fig, ax = plt.subplots(figsize=(6, 5))
-        bars = ax.bar(["Model", "Naive (prev yr)"], [mae, naive_mae], color=["steelblue", "gray"])
-        ax.set_ylabel("Mean Absolute Error")
-        ax.set_title("Projection Accuracy")
+        _style_ax(ax, fig)
+        bars = ax.bar(["Model", "Naive (prev yr)"], [mae, naive_mae], color=[c["bar_model"], c["bar_naive"]], width=0.5)
+        ax.set_ylabel("Mean Absolute Error", fontsize=11)
+        ax.set_title("Projection Accuracy", fontsize=13, fontweight="bold")
         for bar, v in zip(bars, [mae, naive_mae]):
-            ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01, f"{v:.3f}", ha="center")
-        st.pyplot(fig)
+            ax.text(bar.get_x() + bar.get_width() / 2, v + 0.008, f"{v:.3f}", ha="center", fontsize=11, color=c["text"])
+        st.pyplot(fig, transparent=True)
 
     steamer_path = DATA_DIR / f"steamer-{applied['season_to_predict']}.csv"
     zips_path = DATA_DIR / f"zips-{applied['season_to_predict']}.csv"
@@ -581,21 +641,25 @@ if not actual.empty:
             mae_naive = mean_absolute_error(comp["ERA_actual"], comp["ERA_prev"])
 
             fig, ax = plt.subplots(figsize=(7, 5))
+            _style_ax(ax, fig)
             labels = ["Model", "Steamer", "ZiPS", "Naive"]
             vals = [mae_model, mae_steamer, mae_zips, mae_naive]
-            colors = ["steelblue", "coral", "forestgreen", "gray"]
-            bars = ax.bar(labels, vals, color=colors)
-            ax.set_ylabel("Mean Absolute Error")
-            ax.set_title(f"{applied['season_to_predict']} ERA — MAE Comparison")
+            bar_colors = [c["bar_model"], c["bar_steamer"], c["bar_zips"], c["bar_naive"]]
+            bars = ax.bar(labels, vals, color=bar_colors, width=0.55)
+            ax.set_ylabel("Mean Absolute Error", fontsize=11)
+            ax.set_title(f"{applied['season_to_predict']} ERA — MAE Comparison", fontsize=13, fontweight="bold")
             for bar, v in zip(bars, vals):
-                ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01, f"{v:.3f}", ha="center")
-            st.pyplot(fig)
+                ax.text(bar.get_x() + bar.get_width() / 2, v + 0.008, f"{v:.3f}", ha="center", fontsize=11, color=c["text"])
+            st.pyplot(fig, transparent=True)
 
 # ─── Feature importance ───────────────────────────────────────
 st.header("Feature Importance (top 20)")
 importance = pd.Series(model.feature_importances_, index=valid_features).sort_values(ascending=False).head(20)
 
+c = _get_chart_colors()
 fig, ax = plt.subplots(figsize=(8, 6))
-importance.sort_values().plot.barh(ax=ax, color="steelblue")
-ax.set_xlabel("Importance")
-st.pyplot(fig)
+_style_ax(ax, fig)
+importance.sort_values().plot.barh(ax=ax, color=c["importance"])
+ax.set_xlabel("Importance", fontsize=11)
+ax.set_title("Feature Importance", fontsize=13, fontweight="bold")
+st.pyplot(fig, transparent=True)
