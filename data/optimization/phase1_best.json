@@ -1,0 +1,28 @@
+{
+  "score": -0.6332599956917042,
+  "params": {
+    "n_estimators": 700,
+    "max_depth": 10,
+    "learning_rate": 0.08825386733195448,
+    "subsample": 0.8364258113559722,
+    "colsample_bytree": 0.42308236046552455,
+    "min_child_weight": 9,
+    "reg_alpha": 0.0022342588891641796,
+    "reg_lambda": 1.0247370289784765,
+    "gamma": 4.851564737789371,
+    "use_Velocity": false,
+    "use_Horizontal Movement": true,
+    "use_Vertical Movement": true,
+    "use_Batter Contact": true,
+    "use_Batter Vision": true,
+    "use_X-Factor": true,
+    "use_Stuff+": false,
+    "use_Batted Ball": false,
+    "use_Plate Discipline": true,
+    "eng_t1": true,
+    "eng_t2": false,
+    "eng_delta": true,
+    "eng_avg3": false,
+    "min_ip": 50
+  }
+}
