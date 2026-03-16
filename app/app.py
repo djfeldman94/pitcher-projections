@@ -483,11 +483,14 @@ st.header(f"{applied['season_to_predict']} ERA Predictions")
 
 display_cols = ["Name", "Team", "Age", "IP", "ERA", "ERA_predicted"]
 available_display = [c for c in display_cols if c in predictions.columns]
-st.dataframe(
-    predictions[available_display].sort_values("ERA_predicted").reset_index(drop=True),
-    use_container_width=True,
-    height=400,
-)
+pred_df = predictions[available_display].sort_values("ERA_predicted").reset_index(drop=True)
+
+search_query = st.text_input("Search predictions", placeholder="e.g. pitcher name, team...")
+if search_query:
+    mask = pred_df.apply(lambda row: search_query.lower() in " ".join(str(v).lower() for v in row), axis=1)
+    pred_df = pred_df[mask].reset_index(drop=True)
+
+st.dataframe(pred_df, use_container_width=True, height=400)
 
 # ─── Evaluation vs actuals (if available) ─────────────────────
 actual = processed_df[processed_df["Season"] == applied["season_to_predict"]]
