@@ -111,12 +111,14 @@ def engineer_features(df, base_features, engineering):
     return ps, all_feature_cols
 
 
-def train_and_predict(ps, feature_cols, season_to_predict, n_estimators, max_depth, learning_rate, min_ip):
-    train_data = ps.dropna(subset=["ERA_next"])
+@st.cache_resource(show_spinner="Training model...")
+def _train_model(_ps, feature_cols_tuple, season_to_predict, n_estimators, max_depth, learning_rate, min_ip, _config_key):
+    """Train XGBoost model. Cached across all sessions — same config = instant load."""
+    train_data = _ps.dropna(subset=["ERA_next"])
     train_data = train_data[train_data["Season"] < season_to_predict - 1]
     train_data = train_data[train_data["IP"] > min_ip]
 
-    valid_features = [c for c in feature_cols if c in train_data.columns and train_data[c].notna().any()]
+    valid_features = [c for c in feature_cols_tuple if c in train_data.columns and train_data[c].notna().any()]
 
     X_train = train_data[valid_features]
     y_train = train_data["ERA_next"]
@@ -127,6 +129,24 @@ def train_and_predict(ps, feature_cols, season_to_predict, n_estimators, max_dep
         learning_rate=learning_rate,
     )
     model.fit(X_train, y_train)
+    return model, valid_features
+
+
+def train_and_predict(ps, feature_cols, season_to_predict, n_estimators, max_depth, learning_rate, min_ip):
+    config_key = json.dumps({
+        "features": sorted(feature_cols),
+        "season": season_to_predict,
+        "n_est": n_estimators,
+        "depth": max_depth,
+        "lr": round(learning_rate, 6),
+        "min_ip": min_ip,
+    }, sort_keys=True)
+
+    model, valid_features = _train_model(
+        ps, tuple(feature_cols), season_to_predict,
+        n_estimators, max_depth, learning_rate, min_ip,
+        _config_key=config_key,
+    )
 
     target = ps[ps["Season"] == season_to_predict - 1].copy()
     target = target[target["IP"] > min_ip]
@@ -194,6 +214,10 @@ base_df = load_base_data()
 available_features = get_available_features(tuple(base_df.columns))
 available_seasons = sorted(base_df["Season"].unique())
 predict_seasons = [s for s in available_seasons if s >= 2017]
+# Allow predicting one year beyond the data (no actuals to compare, but predictions work)
+next_season = max(available_seasons) + 1
+if next_season not in predict_seasons:
+    predict_seasons.append(next_season)
 categorized = categorize_columns(available_features)
 
 # ─── Sidebar: saved configs ──────────────────────────────────
@@ -457,25 +481,17 @@ if has_changes:
 # ─── Train using the APPLIED config (cached in session state) ─
 applied = st.session_state["applied_config"]
 
-# Only retrain when the applied config actually changes
-applied_key = json.dumps(applied, sort_keys=True, default=str)
-if st.session_state.get("_trained_key") != applied_key:
-    with st.spinner("Engineering features & training model..."):
-        processed_df, all_feature_cols = engineer_features(
-            base_df, applied["base_features"], applied["engineering"],
-        )
-        model, predictions, valid_features = train_and_predict(
-            processed_df, all_feature_cols,
-            applied["season_to_predict"],
-            applied["n_estimators"],
-            applied["max_depth"],
-            applied["learning_rate"],
-            applied["min_ip"],
-        )
-        st.session_state["_trained_key"] = applied_key
-        st.session_state["_trained_results"] = (model, predictions, valid_features, processed_df)
-else:
-    model, predictions, valid_features, processed_df = st.session_state["_trained_results"]
+processed_df, all_feature_cols = engineer_features(
+    base_df, applied["base_features"], applied["engineering"],
+)
+model, predictions, valid_features = train_and_predict(
+    processed_df, all_feature_cols,
+    applied["season_to_predict"],
+    applied["n_estimators"],
+    applied["max_depth"],
+    applied["learning_rate"],
+    applied["min_ip"],
+)
 
 
 # ─── Predictions table ────────────────────────────────────────
@@ -483,7 +499,22 @@ st.header(f"{applied['season_to_predict']} ERA Predictions")
 
 display_cols = ["Name", "Team", "Age", "IP", "ERA", "ERA_predicted"]
 available_display = [c for c in display_cols if c in predictions.columns]
-pred_df = predictions[available_display].sort_values("ERA_predicted").reset_index(drop=True)
+pred_df = predictions[available_display + ["IDfg"]].copy()
+
+# Merge in Steamer/ZiPS projections if available
+pred_year = applied["season_to_predict"]
+steamer_path = DATA_DIR / f"steamer-{pred_year}.csv"
+zips_path = DATA_DIR / f"zips-{pred_year}.csv"
+
+for path, col_name in [(zips_path, "ERA_zips"), (steamer_path, "ERA_steamer")]:
+    if path.exists():
+        ext = pd.read_csv(path).dropna(subset=["PlayerId", "ERA"])
+        ext = ext[ext["PlayerId"].astype(str).str.isnumeric()]
+        ext["PlayerId"] = ext["PlayerId"].astype(int)
+        ext = ext.rename(columns={"ERA": col_name})
+        pred_df = pred_df.merge(ext[["PlayerId", col_name]], left_on="IDfg", right_on="PlayerId", how="left").drop(columns=["PlayerId"])
+
+pred_df = pred_df.drop(columns=["IDfg"]).sort_values("ERA_predicted").reset_index(drop=True)
 
 search_query = st.text_input("Search predictions", placeholder="e.g. pitcher name, team...")
 if search_query:
