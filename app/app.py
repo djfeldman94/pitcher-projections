@@ -196,44 +196,15 @@ available_seasons = sorted(base_df["Season"].unique())
 predict_seasons = [s for s in available_seasons if s >= 2017]
 categorized = categorize_columns(available_features)
 
-# ─── Seed default config ──────────────────────────────────────
-if not (CONFIGS_DIR / "dylan-config.json").exists():
-    with open(DATA_DIR / "feature_columns.json") as f:
-        dylan_features = json.load(f)
-    dylan_base = [f for f in dylan_features if not any(f.endswith(s) for s in ["_t1", "_t2", "_delta_1yr", "_avg_3yr"])]
-    dylan_eng = {}
-    for feat in dylan_features:
-        for suffix in ["_delta_1yr", "_t1", "_t2"]:
-            if feat.endswith(suffix):
-                base = feat[: -len(suffix)]
-                dylan_eng.setdefault(suffix, [])
-                if base not in dylan_eng[suffix]:
-                    dylan_eng[suffix].append(base)
-    save_config("dylan-config", {
-        "base_features": dylan_base,
-        "engineering": dylan_eng,
-        "n_estimators": 500,
-        "max_depth": 6,
-        "learning_rate": 0.07,
-        "min_ip": 15,
-        "season_to_predict": 2025,
-    })
-
 # ─── Sidebar: saved configs ──────────────────────────────────
 st.sidebar.header("Saved Configs")
 
 configs = list_configs()
-selected_config = st.sidebar.selectbox("Load config", ["(none)"] + configs)
-
-# Defaults
-default_base_features = available_features
-default_engineering: dict[str, list[str]] = {}
-default_n_est = 500
-default_depth = 6
-default_lr = 0.07
-default_min_ip = 15
-default_season = predict_seasons[-1]
-
+# Default to "optimized" if it exists
+default_config_idx = 0
+if "optimized" in configs:
+    default_config_idx = configs.index("optimized") + 1  # +1 for "(none)" offset
+selected_config = st.sidebar.selectbox("Load config", ["(none)"] + configs, index=default_config_idx)
 
 def _parse_config(cfg: dict) -> tuple[list[str], dict[str, list[str]]]:
     """Parse a saved config into (base_features, engineering) regardless of format."""
@@ -256,23 +227,45 @@ def _parse_config(cfg: dict) -> tuple[list[str], dict[str, list[str]]]:
     return base, eng
 
 
+# Defaults — load from optimized config so first render has correct values
+default_base_features: list[str] = []
+default_engineering: dict[str, list[str]] = {}
+default_n_est = 500
+default_depth = 6
+default_lr = 0.07
+default_min_ip = 15
+default_season = predict_seasons[-1]
+
+if (CONFIGS_DIR / "optimized.json").exists():
+    _dcfg = load_config("optimized")
+    default_base_features, default_engineering = _parse_config(_dcfg)
+    default_n_est = _dcfg.get("n_estimators", 500)
+    default_depth = _dcfg.get("max_depth", 6)
+    default_lr = _dcfg.get("learning_rate", 0.07)
+    default_min_ip = _dcfg.get("min_ip", 15)
+    default_season = _dcfg.get("season_to_predict", predict_seasons[-1])
+
+
 def _push_config_to_widgets(cfg: dict):
     """Write a saved config into all widget session state keys."""
     base_feats, engineering = _parse_config(cfg)
     base_set = set(base_feats)
 
-    # Set all base feature checkboxes
-    for cat_cols in categorized.values():
+    # Set all base feature checkboxes AND the select-all keys
+    for cat_name, cat_cols in categorized.items():
+        all_selected = all(feat in base_set for feat in cat_cols)
+        st.session_state[f"all_{cat_name}"] = all_selected
         for feat in cat_cols:
             st.session_state[f"base_{feat}"] = feat in base_set
 
-    # Set all engineering checkboxes
+    # Set all engineering checkboxes AND their select-all keys
     for suffix in ENGINEERING_OPTIONS.values():
         eng_set = set(engineering.get(suffix, []))
         for feat in available_features:
-            sk = f"eng_{suffix}_{feat}"
-            if sk in st.session_state:
-                st.session_state[sk] = feat in eng_set
+            st.session_state[f"eng_{suffix}_{feat}"] = feat in eng_set
+        sa_key = f"alleng_{suffix}"
+        if sa_key in st.session_state:
+            st.session_state[sa_key] = False  # safe default
 
     # Set model parameter widgets
     st.session_state["w_n_estimators"] = cfg.get("n_estimators", 500)
@@ -314,14 +307,8 @@ min_ip = st.sidebar.number_input("Minimum IP", min_value=1, max_value=100, value
 season_idx = predict_seasons.index(default_season) if default_season in predict_seasons else len(predict_seasons) - 1
 season_to_predict = st.sidebar.selectbox("Season to predict", options=predict_seasons, index=season_idx, key="w_season")
 
-# ─── Sidebar: save / delete config ────────────────────────────
-st.sidebar.header("Save Config")
-save_name = st.sidebar.text_input("Config name")
 
 # ─── Main: Feature Selection (two tabs) ───────────────────────
-st.header("Feature Selection")
-
-tab_base, tab_eng = st.tabs(["Base Features", "Engineered Features (time-series)"])
 
 N_COLS = 4
 
@@ -337,93 +324,107 @@ def _clear_keys(keys: list[str]):
         st.session_state[k] = False
 
 
-# ── Tab 1: Base feature selection by category ─────────────────
+# Initialize session state defaults for all checkboxes (true first run only)
+# After first init, new keys default to False so selections are sticky.
+first_run = "_initialized" not in st.session_state
+
+for cat_cols in categorized.values():
+    for feat in cat_cols:
+        sk = f"base_{feat}"
+        if sk not in st.session_state:
+            st.session_state[sk] = (feat in default_base_features) if first_run else False
+
+for suffix in ENGINEERING_OPTIONS.values():
+    eng_defaults_for_suffix = set(default_engineering.get(suffix, []))
+    for feat in available_features:
+        sk = f"eng_{suffix}_{feat}"
+        if sk not in st.session_state:
+            st.session_state[sk] = (feat in eng_defaults_for_suffix) if first_run else False
+
+if first_run:
+    st.session_state["_initialized"] = True
+
+
+st.header("Feature Selection")
+
+tab_base, tab_eng = st.tabs(["Base Features", "Engineered Features (time-series)"])
+
 with tab_base:
     st.caption("Select the raw stats to include as model inputs. Organized by category — expand each to pick individual features.")
-
-    for cat_cols in categorized.values():
-        for feat in cat_cols:
-            sk = f"base_{feat}"
-            if sk not in st.session_state:
-                st.session_state[sk] = feat in default_base_features
 
     all_base_keys = [f"base_{feat}" for cat_cols in categorized.values() for feat in cat_cols]
     st.button("Clear all base features", on_click=_clear_keys, args=(all_base_keys,), key="reset_base")
 
-    selected_base_features: list[str] = []
-
     for cat_name, cat_cols in categorized.items():
         child_keys = [f"base_{feat}" for feat in cat_cols]
-        n_selected = sum(1 for k in child_keys if st.session_state.get(k, False))
 
-        with st.expander(f"{cat_name} — {n_selected}/{len(cat_cols)} selected", expanded=False):
-            sa_key = f"all_{cat_name}"
-            st.checkbox(
-                "Select all",
-                value=n_selected == len(cat_cols),
-                key=sa_key,
-                on_change=_toggle_all,
-                args=(child_keys, sa_key),
-            )
+        # Use a stable label so the expander DOM node isn't replaced on rerun
+        with st.expander(cat_name, expanded=False):
+            n_selected = sum(1 for k in child_keys if st.session_state.get(k, False))
+            col_info, col_toggle = st.columns([3, 1])
+            with col_info:
+                st.caption(f"{n_selected}/{len(cat_cols)} selected")
+            with col_toggle:
+                sa_key = f"all_{cat_name}"
+                st.checkbox(
+                    "Select all",
+                    value=n_selected == len(cat_cols),
+                    key=sa_key,
+                    on_change=_toggle_all,
+                    args=(child_keys, sa_key),
+                )
 
             cols = st.columns(N_COLS)
             for i, feat in enumerate(cat_cols):
                 with cols[i % N_COLS]:
-                    if st.checkbox(feat, key=f"base_{feat}"):
-                        selected_base_features.append(feat)
+                    st.checkbox(feat, key=f"base_{feat}")
 
-    st.info(f"**{len(selected_base_features)}** base features selected out of {len(available_features)} available")
+    total_base = sum(1 for k in all_base_keys if st.session_state.get(k, False))
+    st.info(f"**{total_base}** base features selected out of {len(available_features)} available")
 
-# ── Tab 2: Feature engineering ────────────────────────────────
 with tab_eng:
     st.caption(
         "Add time-lagged versions of your selected base features. "
         "These let the model see trends and history — e.g., did a pitcher's velocity drop year-over-year?"
     )
 
-    engineering_selections: dict[str, list[str]] = {}
+    eligible = sorted(f for cat_cols in categorized.values() for f in cat_cols if st.session_state.get(f"base_{f}", False))
 
-    eligible_for_engineering = sorted(selected_base_features)
-
-    if not eligible_for_engineering:
+    if not eligible:
         st.warning("Select some base features first.")
     else:
-        for suffix in ENGINEERING_OPTIONS.values():
-            eng_defaults_for_suffix = set(default_engineering.get(suffix, []))
-            for feat in eligible_for_engineering:
-                sk = f"eng_{suffix}_{feat}"
-                if sk not in st.session_state:
-                    st.session_state[sk] = feat in eng_defaults_for_suffix
-
-        all_eng_keys = [f"eng_{suffix}_{feat}" for suffix in ENGINEERING_OPTIONS.values() for feat in eligible_for_engineering]
+        all_eng_keys = [f"eng_{suffix}_{feat}" for suffix in ENGINEERING_OPTIONS.values() for feat in eligible]
         st.button("Clear all engineered features", on_click=_clear_keys, args=(all_eng_keys,), key="reset_eng")
 
         for label, suffix in ENGINEERING_OPTIONS.items():
-            child_keys = [f"eng_{suffix}_{feat}" for feat in eligible_for_engineering]
-            n_eng = sum(1 for k in child_keys if st.session_state.get(k, False))
+            child_keys = [f"eng_{suffix}_{feat}" for feat in eligible]
 
-            with st.expander(f"{label} — {n_eng}/{len(eligible_for_engineering)} selected", expanded=False):
-                sa_key = f"alleng_{suffix}"
-                st.checkbox(
-                    "Select all",
-                    value=n_eng == len(eligible_for_engineering),
-                    key=sa_key,
-                    on_change=_toggle_all,
-                    args=(child_keys, sa_key),
-                )
+            with st.expander(label, expanded=False):
+                n_eng = sum(1 for k in child_keys if st.session_state.get(k, False))
+                col_info, col_toggle = st.columns([3, 1])
+                with col_info:
+                    st.caption(f"{n_eng}/{len(eligible)} selected")
+                with col_toggle:
+                    sa_key = f"alleng_{suffix}"
+                    st.checkbox(
+                        "Select all",
+                        value=n_eng == len(eligible),
+                        key=sa_key,
+                        on_change=_toggle_all,
+                        args=(child_keys, sa_key),
+                    )
 
-                chosen = []
                 cols = st.columns(N_COLS)
-                for i, feat in enumerate(eligible_for_engineering):
+                for i, feat in enumerate(eligible):
                     with cols[i % N_COLS]:
-                        if st.checkbox(feat, key=f"eng_{suffix}_{feat}"):
-                            chosen.append(feat)
-                if chosen:
-                    engineering_selections[suffix] = chosen
+                        st.checkbox(feat, key=f"eng_{suffix}_{feat}")
 
-        total_eng = sum(len(v) for v in engineering_selections.values())
+        total_eng = sum(1 for k in all_eng_keys if st.session_state.get(k, False))
         if total_eng:
-            st.info(f"**{total_eng}** engineered features will be created ({len(selected_base_features)} base + {total_eng} engineered = **{len(selected_base_features) + total_eng}** total)")
+            st.info(f"**{total_eng}** engineered features will be created ({total_base} base + {total_eng} engineered = **{total_base + total_eng}** total)")
+
+# Read selections from session state (set by the fragment above)
+selected_base_features = [f for cat_cols in categorized.values() for f in cat_cols if st.session_state.get(f"base_{f}", False)]
 
 if not selected_base_features:
     st.error("Select at least one base feature.")
@@ -442,8 +443,12 @@ if has_changes:
     st.markdown("---")
     col_apply, col_msg = st.columns([1, 3])
     with col_apply:
-        if st.button("Apply Changes", type="primary", use_container_width=True):
-            st.session_state["applied_config"] = pending_config
+        def _apply():
+            st.session_state["applied_config"] = _gather_current_selections()
+            # Re-push selections so they survive the rerun
+            _push_config_to_widgets(st.session_state["applied_config"])
+
+        if st.button("Apply Changes", type="primary", use_container_width=True, on_click=_apply):
             st.rerun()
     with col_msg:
         st.warning("You have unapplied changes. Click **Apply Changes** to retrain the model.", icon="\u26a0\ufe0f")
@@ -472,17 +477,6 @@ if st.session_state.get("_trained_key") != applied_key:
 else:
     model, predictions, valid_features, processed_df = st.session_state["_trained_results"]
 
-# ─── Save config button (uses pending so you save what you see) ─
-if st.sidebar.button("Save"):
-    if save_name.strip():
-        save_config(save_name.strip(), pending_config)
-        st.sidebar.success(f"Saved '{save_name.strip()}'")
-        st.rerun()
-
-if selected_config != "(none)":
-    if st.sidebar.button(f"Delete '{selected_config}'"):
-        delete_config(selected_config)
-        st.rerun()
 
 # ─── Predictions table ────────────────────────────────────────
 st.header(f"{applied['season_to_predict']} ERA Predictions")

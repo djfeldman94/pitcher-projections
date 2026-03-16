@@ -1,14 +1,13 @@
 """
 Two-phase optimizer for pitcher projection model.
 
-Phase 1: Bayesian optimization (Optuna) over hyperparams + individual features.
-          Uses feature groups as toggles to keep the search space tractable,
-          then saves the best config for phase 2.
+Phase 1: Bayesian optimization (Optuna) over hyperparams + feature groups.
+          Uses feature group toggles to keep the search space tractable (~200
+          trials, ~7 min). Also explores which lag/engineering transforms help.
 
 Phase 2: Feature pruning. Takes the best config from Phase 1, ranks individual
-          features by importance, iteratively drops the least useful ones,
-          and checks whether removal improves CV score. Saves the final
-          result as a loadable config for the Streamlit app.
+          features by importance, iteratively drops the least useful ones.
+          Saves the result as a Streamlit-loadable config.
 
 Usage:
     python app/optimize.py                  # run both phases
@@ -30,12 +29,9 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "data" / "optimization"
 CONFIGS_DIR = Path(__file__).resolve().parent.parent / "data" / "configs"
 
-# ── Load the full feature list from the notebook pipeline ─────
-with open(DATA_DIR / "feature_columns.json") as f:
-    ALL_FEATURES: list[str] = json.load(f)
+EXCLUDE_COLS = {"IDfg", "Season", "Name", "Team", "Age Rng"}
 
-# Feature groups — used in Phase 1 to keep the search space manageable.
-# Phase 2 then prunes at the individual feature level.
+# ── Feature groups for Phase 1 search ─────────────────────────
 PITCHES = ["FA", "FT", "FC", "FS", "FO", "SI", "SL", "CU", "KC", "CH", "SC", "KN"]
 
 FEATURE_GROUPS = {
@@ -45,44 +41,66 @@ FEATURE_GROUPS = {
     "Batter Contact": ["ERA", "GB%", "Barrel%", "HR/9+"],
     "Batter Vision": ["K%", "BB%", "HR/FB", "SwStr%", "Contact% (sc)"],
     "X-Factor": ["Age", "FIP", "Clutch"],
+    "Stuff+": ["Stuff+", "Location+", "Pitching+"],
+    "Batted Ball": ["Barrel%", "HardHit%", "EV", "LA", "Soft%", "Med%", "Hard%"],
+    "Plate Discipline": ["O-Swing%", "Z-Swing%", "O-Contact%", "Z-Contact%", "Zone%", "SwStr%"],
 }
 
-LAG_ELIGIBLE_GROUPS = {"Velocity", "Horizontal Movement", "Vertical Movement"}
+ENGINEERING_OPTIONS = {
+    "_t1": "shift(1)",
+    "_t2": "shift(2)",
+    "_delta_1yr": "delta",
+    "_avg_3yr": "avg3",
+}
 
 
-def lag_columns_for(base_cols: list[str]) -> list[str]:
-    out = []
-    for col in base_cols:
-        out += [f"{col}_delta_1yr", f"{col}_t1", f"{col}_t2"]
-    return out
+def load_base_data():
+    return pd.read_parquet(DATA_DIR / "pitching_stats.parquet")
 
 
-def build_feature_list(selected_groups: list[str]) -> list[str]:
-    features = []
-    for group in selected_groups:
-        base = FEATURE_GROUPS[group]
-        features += base
-        if group in LAG_ELIGIBLE_GROUPS:
-            features += lag_columns_for(base)
-    return features
+def engineer_features(df, base_features, engineering):
+    """Same logic as the Streamlit app."""
+    ps = df.copy().sort_values(["IDfg", "Season"])
+    all_feature_cols = list(base_features)
+
+    for suffix, cols in engineering.items():
+        for col in cols:
+            if col not in ps.columns:
+                continue
+            if suffix == "_t1":
+                ps[f"{col}{suffix}"] = ps.groupby("IDfg")[col].shift(1)
+            elif suffix == "_t2":
+                ps[f"{col}{suffix}"] = ps.groupby("IDfg")[col].shift(2)
+            elif suffix == "_delta_1yr":
+                t1 = ps.groupby("IDfg")[col].shift(1)
+                ps[f"{col}{suffix}"] = ps[col] - t1
+            elif suffix == "_avg_3yr":
+                t1 = ps.groupby("IDfg")[col].shift(1)
+                t2 = ps.groupby("IDfg")[col].shift(2)
+                ps[f"{col}{suffix}"] = (ps[col] + t1 + t2) / 3
+            all_feature_cols.append(f"{col}{suffix}")
+
+    ps["ERA_next"] = ps.groupby("IDfg")["ERA"].shift(-1)
+    return ps, all_feature_cols
 
 
-def load_training_data(min_ip: int = 15):
-    ps = pd.read_parquet(DATA_DIR / "processed_pitch_stats.parquet")
+def prepare_training_data(ps, feature_cols, min_ip):
+    """Filter and prepare training data, returning X, y, valid_features."""
     train = ps.dropna(subset=["ERA_next"])
     train = train[train["IP"] > min_ip]
     max_season = train["Season"].max()
     train = train[train["Season"] < max_season]
-    return train
 
-
-def evaluate(train: pd.DataFrame, feature_cols: list[str], params: dict, cv: int = 5) -> float:
-    """Return mean negative MAE across CV folds (higher = better)."""
     valid = [c for c in feature_cols if c in train.columns and train[c].notna().any()]
-    if not valid:
+    return train, valid
+
+
+def evaluate(train, valid_features, params, cv=5):
+    """Return mean negative MAE across CV folds (higher = better)."""
+    if not valid_features:
         return -10.0
 
-    X = train[valid]
+    X = train[valid_features]
     y = train["ERA_next"]
 
     model = xgb.XGBRegressor(**params)
@@ -90,9 +108,10 @@ def evaluate(train: pd.DataFrame, feature_cols: list[str], params: dict, cv: int
     return scores.mean()
 
 
-# ── Phase 1: Bayesian optimization over hyperparams + feature groups ──
+# ── Phase 1: Bayesian optimization ────────────────────────────
 
-def phase1_objective(trial, train):
+def phase1_objective(trial, base_df):
+    # Hyperparameters
     params = {
         "n_estimators": trial.suggest_int("n_estimators", 50, 1500, step=50),
         "max_depth": trial.suggest_int("max_depth", 2, 10),
@@ -105,36 +124,58 @@ def phase1_objective(trial, train):
         "gamma": trial.suggest_float("gamma", 0.0, 5.0),
     }
 
-    selected = []
-    for group in FEATURE_GROUPS:
-        if trial.suggest_categorical(f"use_{group}", [True, False]):
-            selected.append(group)
-    if not selected:
+    # Feature group selection
+    base_features = []
+    for group_name, group_cols in FEATURE_GROUPS.items():
+        if trial.suggest_categorical(f"use_{group_name}", [True, False]):
+            base_features.extend(group_cols)
+    if not base_features:
         return -10.0
+    # Deduplicate (some features appear in multiple groups)
+    base_features = list(dict.fromkeys(base_features))
+
+    # Engineering toggles
+    engineering = {}
+    use_t1 = trial.suggest_categorical("eng_t1", [True, False])
+    use_t2 = trial.suggest_categorical("eng_t2", [True, False])
+    use_delta = trial.suggest_categorical("eng_delta", [True, False])
+    use_avg3 = trial.suggest_categorical("eng_avg3", [True, False])
+
+    # Apply engineering to velocity/movement features (most impactful for trends)
+    eng_eligible = [f for f in base_features if "(sc)" in f and ("v" in f or "-X" in f or "-Z" in f)]
+    if use_t1 and eng_eligible:
+        engineering["_t1"] = eng_eligible
+    if use_t2 and eng_eligible:
+        engineering["_t2"] = eng_eligible
+    if use_delta and eng_eligible:
+        engineering["_delta_1yr"] = eng_eligible
+    if use_avg3 and eng_eligible:
+        engineering["_avg_3yr"] = eng_eligible
 
     min_ip = trial.suggest_int("min_ip", 10, 50, step=5)
-    filtered = train[train["IP"] > min_ip]
 
-    features = build_feature_list(selected)
-    return evaluate(filtered, features, params)
+    ps, all_feature_cols = engineer_features(base_df, base_features, engineering)
+    train, valid_features = prepare_training_data(ps, all_feature_cols, min_ip)
+
+    return evaluate(train, valid_features, params)
 
 
-def run_phase1(n_trials: int = 200):
+def run_phase1(n_trials=200):
     print(f"Phase 1: Bayesian optimization ({n_trials} trials)")
     print("=" * 60)
 
-    train = load_training_data()
+    base_df = load_base_data()
 
     study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
-    study.optimize(lambda trial: phase1_objective(trial, train), n_trials=n_trials, show_progress_bar=True)
+    study.optimize(lambda trial: phase1_objective(trial, base_df), n_trials=n_trials, show_progress_bar=True)
 
     best = study.best_trial
     print(f"\nBest CV MAE: {-best.value:.4f}")
-    print(f"Best params: {json.dumps(best.params, indent=2)}")
+    print(f"Best params: {json.dumps(best.params, indent=2, default=str)}")
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     with open(RESULTS_DIR / "phase1_best.json", "w") as f:
-        json.dump({"score": best.value, "params": best.params}, f, indent=2)
+        json.dump({"score": best.value, "params": best.params}, f, indent=2, default=str)
 
     df = study.trials_dataframe()
     df.to_csv(RESULTS_DIR / "phase1_trials.csv", index=False)
@@ -158,23 +199,45 @@ def run_phase2():
 
     all_params = best["params"]
 
+    # Separate XGBoost params from search params
     xgb_params = {}
     selected_groups = []
     min_ip = 15
+    eng_flags = {}
+
     for k, v in all_params.items():
         if k.startswith("use_"):
             if v:
-                group_name = k[4:]
-                selected_groups.append(group_name)
+                selected_groups.append(k[4:])
         elif k == "min_ip":
             min_ip = v
+        elif k.startswith("eng_"):
+            eng_flags[k] = v
         else:
             xgb_params[k] = v
 
-    train = load_training_data()
-    train = train[train["IP"] > min_ip]
-    all_features = build_feature_list(selected_groups)
-    valid_features = [c for c in all_features if c in train.columns and train[c].notna().any()]
+    # Rebuild base features from groups
+    base_features = []
+    for group_name in selected_groups:
+        if group_name in FEATURE_GROUPS:
+            base_features.extend(FEATURE_GROUPS[group_name])
+    base_features = list(dict.fromkeys(base_features))
+
+    # Rebuild engineering
+    eng_eligible = [f for f in base_features if "(sc)" in f and ("v" in f or "-X" in f or "-Z" in f)]
+    engineering = {}
+    if eng_flags.get("eng_t1") and eng_eligible:
+        engineering["_t1"] = eng_eligible
+    if eng_flags.get("eng_t2") and eng_eligible:
+        engineering["_t2"] = eng_eligible
+    if eng_flags.get("eng_delta") and eng_eligible:
+        engineering["_delta_1yr"] = eng_eligible
+    if eng_flags.get("eng_avg3") and eng_eligible:
+        engineering["_avg_3yr"] = eng_eligible
+
+    base_df = load_base_data()
+    ps, all_feature_cols = engineer_features(base_df, base_features, engineering)
+    train, valid_features = prepare_training_data(ps, all_feature_cols, min_ip)
 
     baseline_score = evaluate(train, valid_features, xgb_params)
     print(f"Baseline MAE: {-baseline_score:.4f} ({len(valid_features)} features)")
@@ -214,12 +277,25 @@ def run_phase2():
     print(f"\nFinal: {len(best_features)} features, MAE {-best_score:.4f}")
     print(f"Dropped {len(valid_features) - len(best_features)} features")
 
+    # Separate final features into base vs engineered for config format
+    final_base = [f for f in best_features if not any(f.endswith(s) for s in ["_t1", "_t2", "_delta_1yr", "_avg_3yr"])]
+    final_eng = {}
+    for f in best_features:
+        for suffix in ["_t1", "_t2", "_delta_1yr", "_avg_3yr"]:
+            if f.endswith(suffix):
+                base_col = f[: -len(suffix)]
+                final_eng.setdefault(suffix, [])
+                if base_col not in final_eng[suffix]:
+                    final_eng[suffix].append(base_col)
+
     # Save optimization results
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     result = {
         "xgb_params": xgb_params,
         "min_ip": min_ip,
-        "features": best_features,
+        "base_features": final_base,
+        "engineering": final_eng,
+        "all_features": best_features,
         "dropped_features": [f for f in valid_features if f not in best_features],
         "mae": -best_score,
         "n_features_original": len(valid_features),
@@ -228,10 +304,11 @@ def run_phase2():
     with open(RESULTS_DIR / "phase2_result.json", "w") as f:
         json.dump(result, f, indent=2)
 
-    # Also save as a Streamlit-loadable config
+    # Save as Streamlit-loadable config
     CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
-    save_config = {
-        "features": best_features,
+    streamlit_config = {
+        "base_features": final_base,
+        "engineering": final_eng,
         "n_estimators": xgb_params.get("n_estimators", 500),
         "max_depth": xgb_params.get("max_depth", 6),
         "learning_rate": xgb_params.get("learning_rate", 0.07),
@@ -239,7 +316,7 @@ def run_phase2():
         "season_to_predict": 2025,
     }
     with open(CONFIGS_DIR / "optimized.json", "w") as f:
-        json.dump(save_config, f, indent=2)
+        json.dump(streamlit_config, f, indent=2)
 
     print(f"\nResults saved to {RESULTS_DIR}/")
     print(f"Streamlit config saved as 'optimized' (load it from the app sidebar)")
