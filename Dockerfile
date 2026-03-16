@@ -9,12 +9,14 @@ RUN apt-get update && \
 COPY app/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app/ ./app/
+COPY app/app.py ./app/
 COPY data/raw/ ./data/raw/
+COPY data/configs/ ./data/configs/
 COPY .streamlit/ ./.streamlit/
 
 EXPOSE 8501
 
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl --fail http://localhost:8501/_stcore/health
 
 ENTRYPOINT ["streamlit", "run", "app/app.py", "--server.port=8501", "--server.address=0.0.0.0"]

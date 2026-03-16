@@ -377,15 +377,20 @@ else:
         st.session_state["_loaded_config_name"] = None
 
 # ─── Sidebar: model parameters ────────────────────────────────
+# Only pass default values when the key isn't already in session state
+# (avoids "default value + session state" warning after config push)
 st.sidebar.header("Model Parameters")
-n_estimators = st.sidebar.slider("n_estimators", 50, 1500, default_n_est, step=50, key="w_n_estimators")
-max_depth = st.sidebar.slider("max_depth", 2, 12, default_depth, key="w_max_depth")
-learning_rate = st.sidebar.slider("learning_rate", 0.01, 0.30, default_lr, step=0.01, key="w_learning_rate")
+_slider_kw = lambda k, v: {"value": v} if k not in st.session_state else {}
+n_estimators = st.sidebar.slider("n_estimators", 50, 1500, step=50, key="w_n_estimators", **_slider_kw("w_n_estimators", default_n_est))
+max_depth = st.sidebar.slider("max_depth", 2, 12, key="w_max_depth", **_slider_kw("w_max_depth", default_depth))
+learning_rate = st.sidebar.slider("learning_rate", 0.01, 0.30, step=0.01, key="w_learning_rate", **_slider_kw("w_learning_rate", default_lr))
 
 st.sidebar.header("Data Filters")
-min_ip = st.sidebar.number_input("Minimum IP", min_value=1, max_value=100, value=default_min_ip, key="w_min_ip")
+_num_kw = lambda k, v: {"value": v} if k not in st.session_state else {}
+min_ip = st.sidebar.number_input("Minimum IP", min_value=1, max_value=100, key="w_min_ip", **_num_kw("w_min_ip", default_min_ip))
+_sel_kw = lambda k, idx: {"index": idx} if k not in st.session_state else {}
 season_idx = predict_seasons.index(default_season) if default_season in predict_seasons else len(predict_seasons) - 1
-season_to_predict = st.sidebar.selectbox("Season to predict", options=predict_seasons, index=season_idx, key="w_season")
+season_to_predict = st.sidebar.selectbox("Season to predict", options=predict_seasons, key="w_season", **_sel_kw("w_season", season_idx))
 
 
 # ─── Main: Feature Selection (two tabs) ───────────────────────

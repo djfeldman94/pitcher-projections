@@ -1,0 +1,16 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+notebooks/
+blog_assets/
+data/optimization/
+data/raw/processed_pitch_stats.parquet
+data/raw/feature_columns.json
+data/raw/train_data.parquet
+data/raw/X.parquet
+data/raw/y.parquet
+data/raw/*_prediction.parquet
+figures/
+*.ipynb
+.ipynb_checkpoints/
